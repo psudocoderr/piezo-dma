@@ -1,1 +1,2 @@
-*.h
+secrets.h
+*.csv
