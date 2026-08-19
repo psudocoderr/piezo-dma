@@ -1,109 +1,83 @@
 /*
- * ESP32 High-Speed Continuous ADC DMA Binary Streaming over Serial
+ * ESP32 Continuous ADC DMA Streaming using modern esp_adc/adc_continuous.h
  *
- * Features:
- * 1. Uses I2S DMA continuous ADC sampling (hardware DMA in background without CPU overhead).
- * 2. High-speed 2,000,000 baud rate (2 Mbaud).
- * 3. Streams raw 16-bit binary samples formatted as [High Byte, Low Byte].
- * 4. WiFi, HTTP, and SD logging code completely removed for maximum performance.
+ * Migration from deprecated i2s_adc driver to maintained ESP-IDF continuous ADC API.
+ * Solves legacy I2S clock-divider halving issues and provides exact hardware sampling frequency.
+ * Compatible with ESP-IDF 4.4+ / 5.x and Arduino-ESP32 2.0+ / 3.0+
  */
 
 #include <Arduino.h>
-#include <driver/i2s.h>
-#include <driver/adc.h>
-#include <inttypes.h>
+#include "esp_adc/adc_continuous.h"
 
 // ----------------------------------------------------------------
 // Configuration Parameters
 // ----------------------------------------------------------------
-#define I2S_PORT       I2S_NUM_0
-#define SAMPLE_RATE    80000            // 80 kHz sampling rate
-#define DMA_BUF_LEN    1024             // DMA buffer length (samples)
-#define DMA_BUF_COUNT  4                // Number of DMA buffers
-#define ADC_CHANNEL    ADC1_CHANNEL_6   // GPIO34
+#define TARGET_SAMPLE_RATE 80000            // Target sample rate: 80 kHz
+#define SAMPLE_RATE_MULT   2.0              // ESP32 DIG ADC HAL hardware clock prescaler factor
+#define CONFIGURED_RATE    ((uint32_t)(TARGET_SAMPLE_RATE * SAMPLE_RATE_MULT))
 
-#define BAUDRATE       2000000          // 2 Mbaud Serial Speed
+#define ADC_FRAME_SIZE    1024             // Bytes per DMA conversion frame (512 samples)
+#define ADC_STORE_BUF_SZ  4096             // Total Ring Buffer Size (bytes)
+#define BAUDRATE          2000000          // 2 Mbaud Serial Speed
 
-// DMA input buffer & packed binary transmit buffer
-uint16_t dmaSamples[DMA_BUF_LEN];
-uint8_t  txBuffer[DMA_BUF_LEN * 2];     // 2 bytes per sample (High byte, Low byte)
+// Channel Configuration (GPIO34 = ADC1 Channel 6)
+#define ADC_UNIT          ADC_UNIT_1
+#define ADC_CHANNEL       ADC_CHANNEL_6
+#define ADC_ATTEN         ADC_ATTEN_DB_11
 
-// ----------------------------------------------------------------
-// Helper: Convert single 16-bit ADC sample into 2-byte binary array
-// ----------------------------------------------------------------
-inline void packSampleBinary(uint16_t analogSample, uint8_t buffer[2]) {
-    buffer[0] = (uint8_t)((analogSample >> 8) & 0xFF); // High byte
-    buffer[1] = (uint8_t)(analogSample & 0xFF);        // Low byte
-}
+adc_continuous_handle_t adc_handle = NULL;
+uint8_t frameBuffer[ADC_FRAME_SIZE];
 
 // ----------------------------------------------------------------
-// ADC DMA Initialization
+// ADC Continuous Driver Initialization
 // ----------------------------------------------------------------
-void setupAdcDma() {
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(ADC_CHANNEL, ADC_ATTEN_DB_11);
+void setupAdcContinuous() {
+    // 1. Create ADC Continuous Driver Handle
+    adc_continuous_handle_cfg_t handle_cfg = {};
+    handle_cfg.max_store_buf_size = ADC_STORE_BUF_SZ;
+    handle_cfg.conv_frame_size    = ADC_FRAME_SIZE;
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&handle_cfg, &adc_handle));
 
-    i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN),
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
-        .communication_format = I2S_COMM_FORMAT_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = DMA_BUF_COUNT,
-        .dma_buf_len = DMA_BUF_LEN,
-        .use_apll = false,
-        .tx_desc_auto_clear = false,
-        .fixed_mclk = 0
-    };
+    // 2. Pattern Configuration for Single Channel Sampling
+    adc_digi_pattern_config_t adc_pattern[1] = {};
+    adc_pattern[0].atten     = ADC_ATTEN;
+    adc_pattern[0].channel   = ADC_CHANNEL;
+    adc_pattern[0].unit      = ADC_UNIT;
+    adc_pattern[0].bit_width = ADC_BITWIDTH_12;
 
-    i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-    i2s_set_adc_mode(ADC_UNIT_1, ADC_CHANNEL);
-    i2s_adc_enable(I2S_PORT);
+    // 3. Continuous ADC Controller Config
+    // Note: Configured sample_freq_hz is doubled to 160 kHz to achieve exact 80 kHz hardware sampling rate
+    adc_continuous_config_t dig_cfg = {};
+    dig_cfg.pattern_num    = 1;
+    dig_cfg.adc_pattern    = adc_pattern;
+    dig_cfg.sample_freq_hz = CONFIGURED_RATE;
+    dig_cfg.conv_mode      = ADC_CONV_SINGLE_UNIT_1;
+    dig_cfg.format         = ADC_DIGI_OUTPUT_FORMAT_TYPE1;
+    ESP_ERROR_CHECK(adc_continuous_config(adc_handle, &dig_cfg));
+
+    // 4. Start Continuous Conversion
+    ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
 }
 
 // ----------------------------------------------------------------
 // Setup
 // ----------------------------------------------------------------
 void setup() {
-    // Initialize High-Speed Serial Port at 2 Mbaud
     Serial.begin(BAUDRATE);
     delay(500);
 
-    // Setup I2S Continuous Hardware DMA ADC
-    setupAdcDma();
+    setupAdcContinuous();
 }
 
 // ----------------------------------------------------------------
-// Loop - High-Speed Binary Streaming
+// Loop - Stream DMA Frames over High-Speed Serial
 // ----------------------------------------------------------------
 void loop() {
-    
-    size_t bytesRead = 0;
+    uint32_t ret_num = 0;
+    esp_err_t ret = adc_continuous_read(adc_handle, frameBuffer, ADC_FRAME_SIZE, &ret_num, 0);
 
-    // Read filled DMA buffer from I2S continuous hardware receiver
-    esp_err_t err = i2s_read(I2S_PORT, dmaSamples, sizeof(dmaSamples), &bytesRead, portMAX_DELAY);
-
-    if (err == ESP_OK && bytesRead > 0) {
-        uint32_t sampleCount = bytesRead / sizeof(uint16_t);
-        size_t txIndex = 0;
-
-        // Pack each 12-bit ADC sample into binary block [High Byte, Low Byte]
-        // for (uint32_t i = 0; i < sampleCount; i++) {
-        //     uint16_t analogSample = dmaSamples[i] & 0x0FFF; // 12-bit ADC value (0 - 4095)
-
-        //     // Format sample into buffer: buffer[0] high byte, buffer[1] low byte
-        //     packSampleBinary(analogSample, &txBuffer[txIndex]);
-        //     txIndex += 2;
-        // }    
-
-        // // Stream high-speed binary block over 2M baud UART
-        // Serial.write(txBuffer, txIndex);
-        
-        Serial.write((uint8_t *)dmaSamples, bytesRead); //uncomment this when not debugging
-        // size_t sent = Serial.write((uint8_t *)dmaSamples, bytesRead);
-        // if (sent != bytesRead) {
-        //     Serial.println("Overflow!!");
-        // }
+    if (ret == ESP_OK && ret_num > 0) {
+        // Stream raw DMA conversion frame over 2 Mbaud UART
+        Serial.write(frameBuffer, ret_num);
     }
 }

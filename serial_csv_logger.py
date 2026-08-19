@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
 High-Speed ESP32 Binary ADC Receiver & CSV Logger
-
 Reads 16-bit binary continuous ADC blocks from ESP32 over Serial (2 Mbaud),
 converts bytes [High Byte, Low Byte] into raw ADC values and analog voltages,
 applies microsecond-accurate batch timestamps, and logs samples to a local CSV file.
 """
-
 import sys
 import time
 import argparse
 import csv
 from datetime import datetime
 import serial
-
+import numpy as np
 def parse_args():
     parser = argparse.ArgumentParser(description="ESP32 High-Speed ADC Binary Data Receiver & CSV Logger")
     parser.add_argument("-p", "--port", type=str, default="/dev/ttyUSB0", help="Serial port (e.g. /dev/ttyUSB0 or COM3)")
@@ -22,7 +20,6 @@ def parse_args():
     parser.add_argument("-r", "--sample-rate", type=float, default=80000.0, help="Expected sampling rate in Hz (default: 80000)")
     parser.add_argument("-v", "--vref", type=float, default=3.3, help="ADC reference voltage in Volts (default: 3.3V)")
     return parser.parse_args()
-
 def main():
     args = parse_args()
 
@@ -35,7 +32,6 @@ def main():
     print(f" ADC Ref Voltage : {args.vref} V")
     print(f" CSV Output      : {args.output}")
     print("==================================================")
-
     # Open serial connection
     try:
         ser = serial.Serial(args.port, args.baud, timeout=1.0)
@@ -45,7 +41,6 @@ def main():
         print(f"[!] Error opening serial port {args.port}: {e}")
         print("    Please check device connection or permissions (e.g., sudo chmod 666 /dev/ttyUSB0).")
         sys.exit(1)
-
     # Open CSV file for writing
     try:
         csv_file = open(args.output, mode="w", newline="", buffering=1024 * 1024)
@@ -57,7 +52,6 @@ def main():
         print(f"[!] Error opening output file {args.output}: {e}")
         ser.close()
         sys.exit(1)
-
     # Processing State & Counters
     sample_interval = 1.0 / args.sample_rate
     bytes_per_sample = 2
@@ -69,52 +63,48 @@ def main():
     start_time = time.time()
     last_report_time = start_time
     report_samples = 0
-
     print("\n[>] Continuous logging started. Press Ctrl+C to stop.\n")
-
     try:
         while True:
             # Read binary chunk from serial stream
             raw_data = ser.read(chunk_bytes)
             if not raw_data:
                 continue
-
             batch_recv_time = time.time()
             num_bytes = len(raw_data)
             num_samples = num_bytes // bytes_per_sample
-
             if num_samples == 0:
                 continue
-
-            # Calculate precise sample times anchored to batch arrival time
+            # Batch timestamping: calculate precise sample times anchored to batch arrival time
+            # sample_time_i = batch_recv_time - (num_samples - i) * sample_interval
             batch_start_sample_time = batch_recv_time - (num_samples * sample_interval)
+            # Vectorized fast byte parsing using NumPy
+            raw_u16 = np.frombuffer(raw_data, dtype=np.uint16)
+            raw_adc = np.bitwise_and(raw_u16, 0x0FFF)
+            voltages = raw_adc * (args.vref / 4095.0)
 
-            rows = []
-            for i in range(num_samples):
-                byte_offset = i * 2
-                high_byte = raw_data[byte_offset]
-                low_byte = raw_data[byte_offset + 1]
+            # Vectorized timestamps & sample indices
+            indices = np.arange(num_samples)
+            sample_epochs = batch_start_sample_time + (indices * sample_interval)
+            global_indices = total_samples + indices
 
-                # Convert binary [High Byte, Low Byte] to 12-bit ADC value
-                raw_adc = ((high_byte << 8) | low_byte) & 0x0FFF
-
-                # Convert raw ADC value (0-4095) to analog voltage
-                voltage = raw_adc * (args.vref / 4095.0)
-
-                # Compute precise timestamp for sample i
-                sample_epoch = batch_start_sample_time + (i * sample_interval)
-                sample_iso = datetime.fromtimestamp(sample_epoch).strftime('%Y-%m-%d %H:%M:%S.%f')
-
-                sample_idx = total_samples + i
-                rows.append([sample_iso, f"{sample_epoch:.6f}", sample_idx, raw_adc, f"{voltage:.4f}"])
+            # Fast row formatting
+            rows = [
+                (
+                    datetime.fromtimestamp(sample_epochs[i]).strftime("%Y-%m-%d %H:%M:%S.%f"),
+                    f"{sample_epochs[i]:.6f}",
+                    int(global_indices[i]),
+                    int(raw_adc[i]),
+                    f"{voltages[i]:.4f}",
+                )
+                for i in range(num_samples)
+            ]
 
             # Fast batch write to CSV
             csv_writer.writerows(rows)
-
             total_samples += num_samples
             report_samples += num_samples
             total_bytes += num_bytes
-
             # Telemetry reporting every 1 second
             now = time.time()
             elapsed_report = now - last_report_time
@@ -124,7 +114,6 @@ def main():
                 print(f"\r[Telemetry] Logging Rate: {rate_hz:8.1f} Hz | Data Rate: {data_rate_kb:6.1f} KB/s | Total Samples: {total_samples:,}", end="", flush=True)
                 last_report_time = now
                 report_samples = 0
-
     except KeyboardInterrupt:
         print("\n\n[!] Stopping acquisition...")
     finally:
@@ -141,6 +130,5 @@ def main():
         print(f" Average Data Rate  : {avg_rate:.1f} Hz")
         print(f" Saved CSV File     : {args.output}")
         print("==================================================")
-
 if __name__ == "__main__":
     main()
