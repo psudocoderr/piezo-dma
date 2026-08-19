@@ -18,6 +18,7 @@
 #define DMA_BUF_LEN    1024
 #define DMA_BUF_COUNT  4
 #define ADC_CHANNEL    ADC1_CHANNEL_6   // GPIO34
+#define TELEMETRY_VIEWER 1
 
 uint16_t dmaSamples[DMA_BUF_LEN];
 
@@ -353,9 +354,10 @@ void setupAdcDma()
 //------------------------------------------------------------
 void setup()
 {
-    Serial.begin(115200);
+    Serial.begin(921600); // 115200
     delay(1000);
 
+    #if !TELEMETRY_VIEWER
     Serial.println("--------------------------------");
     Serial.println("ESP32 ADC DMA -> HTTP Uploader");
     Serial.printf("Sample Rate      : %d Hz\n", SAMPLE_RATE);
@@ -363,6 +365,7 @@ void setup()
     Serial.print("HTTP URL         : ");
     Serial.println(SERVER_URL);
     Serial.println("--------------------------------");
+    #endif
 
     setupTime();
 
@@ -370,10 +373,12 @@ void setup()
     netClient.setInsecure();
     netClient.setHandshakeTimeout(15);
 
+    #if !TELEMETRY_VIEWER
     sampleQueue = xQueueCreate(SAMPLE_QUEUE_DEPTH, sizeof(DmaBlock));
 
     // Stack 16384: TLS handshake needs ~10 KB of stack on ESP32
     xTaskCreatePinnedToCore(uploadTask, "uploadTask", 16384, nullptr, 1, nullptr, 1);
+    #endif
 
     setupAdcDma();
 
@@ -412,12 +417,21 @@ void loop()
 
     for (uint32_t i = 0; i < sampleCount; i++)
         block.values[i] = dmaSamples[i] & 0x0FFF;
+    
+    #if TELEMETRY_VIEWER
+    for (uint32_t i = 0; i < sampleCount; i += 2)
+    {
+        Serial.println(block.values[i]);
+    }
+    #endif
 
+    #if !TELEMETRY_VIEWER
     if (xQueueSend(sampleQueue, &block, 0) != pdTRUE)
     {
         droppedBlocks++;
     }
-
+    #endif
+    
     totalSamples += sampleCount;
 
     uint32_t now = millis();
@@ -425,6 +439,7 @@ void loop()
     {
         float rate = totalSamples * 1000.0f / (now - lastReport);
 
+        #if !TELEMETRY_VIEWER
         Serial.println("--------------------------------");
         Serial.printf("DMA Rate     : %.1f samples/sec (target %d)\n", rate, SAMPLE_RATE);
         Serial.printf("Queue Used   : %u / %u\n",
@@ -433,6 +448,7 @@ void loop()
         Serial.printf("Dropped      : %u blocks\n", (unsigned)droppedBlocks);
         Serial.printf("Free Heap    : %u bytes\n", (unsigned)ESP.getFreeHeap());
         Serial.println("--------------------------------");
+        #endif
 
         totalSamples = 0;
         lastReport = now;
