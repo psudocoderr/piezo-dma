@@ -11,19 +11,6 @@
 #include "secrets.h"
 
 // ----------------------------------------------------------------
-// Operating Mode Toggle
-// Set TELEMETRY_VIEWER to 1 for Direct Binary Serial.write Streaming (2 Mbaud)
-// Set TELEMETRY_VIEWER to 0 for Background HTTP Upload Mode
-// ----------------------------------------------------------------
-#define TELEMETRY_VIEWER 1
-
-#if TELEMETRY_VIEWER
-#define SERIAL_BAUD_RATE 2000000
-#else
-#define SERIAL_BAUD_RATE 921600
-#endif
-
-// ----------------------------------------------------------------
 // I2S / ADC DMA
 // ----------------------------------------------------------------
 #define I2S_PORT       I2S_NUM_0
@@ -31,24 +18,12 @@
 #define DMA_BUF_LEN    1024
 #define DMA_BUF_COUNT  4
 #define ADC_CHANNEL    ADC1_CHANNEL_6   // GPIO34
+#define TELEMETRY_VIEWER 1
 
 uint16_t dmaSamples[DMA_BUF_LEN];
 
 uint32_t totalSamples = 0;
 uint32_t lastReport = 0;
-
-// ----------------------------------------------------------------
-// Binary Serial Packet Header (used when streaming binary)
-// ----------------------------------------------------------------
-#pragma pack(push, 1)
-struct BinaryPacketHeader {
-    uint8_t  magic[2];     // {0xAA, 0x55}
-    uint16_t count;        // Number of 16-bit samples following
-    uint32_t epochSec;     // Unix timestamp (seconds)
-    uint16_t ms;           // Milliseconds (0-999)
-    uint32_t durationUs;   // Block acquisition duration in microseconds
-};
-#pragma pack(pop)
 
 // ----------------------------------------------------------------
 // HTTP batch upload
@@ -77,6 +52,10 @@ enum class UploadResult : uint8_t
 const size_t BATCH_SIZE = DMA_BUF_LEN;          // one full DMA block per POST
 const size_t JSON_PAYLOAD_CAPACITY = 40960;     // ~1024 samples * ~35B + headroom
 
+// Queue depth is RAM-bound, not rate-bound: each DmaBlock is ~2KB, so this
+// buys ~6 blocks (~75ms) of headroom before a slow POST starts dropping
+// blocks. See note at the bottom of the chat response about the rate
+// mismatch between 80kHz acquisition and HTTPS upload throughput.
 const UBaseType_t SAMPLE_QUEUE_DEPTH = 6;
 
 QueueHandle_t      sampleQueue;
@@ -93,6 +72,10 @@ bool appendSampleJson(char* out, size_t cap, size_t& len, const FlatSample& samp
 bool buildPayload(char* out, size_t cap, FlatSample* buf, size_t count, size_t& len);
 UploadResult postBatch(HTTPClient& http, FlatSample* buf, size_t count);
 
+//------------------------------------------------------------
+// HTTP batch upload - JSON schema unchanged:
+// {"device":"...","samples":[{"t":<epoch>,"ms":<0-999>,"v":<adc>},...]}
+//------------------------------------------------------------
 bool appendText(char* out, size_t cap, size_t& len, const char* text)
 {
     size_t textLen = strlen(text);
@@ -128,8 +111,8 @@ bool buildPayload(char* out, size_t cap, FlatSample* buf, size_t count, size_t& 
 
     if (!appendText(out, cap, len, "{\"device\":\""))
         return false;
-    if (!appendText(out, cap, len, DEVICE_ID))
-        return false;
+        if (!appendText(out, cap, len, DEVICE_ID))
+            return false;
     if (!appendText(out, cap, len, "\",\"samples\":["))
         return false;
 
@@ -163,6 +146,8 @@ UploadResult postBatch(HTTPClient& http, FlatSample* buf, size_t count)
         return UploadResult::Drop;
     }
 
+    // Largest CONTIGUOUS block matters more than total free heap for TLS -
+    // mbedTLS needs one big chunk (~16KB per direction), not scattered ones.
     Serial.printf("[HTTP] Payload: %u bytes | Free heap: %u | Largest block: %u bytes\n",
                   (unsigned)payloadLen,
                   (unsigned)ESP.getFreeHeap(),
@@ -177,7 +162,7 @@ UploadResult postBatch(HTTPClient& http, FlatSample* buf, size_t count)
     http.addHeader("Content-Type", "application/json");
     http.addHeader("Authorization", String("Bearer ") + AUTH_TOKEN);
     http.addHeader("User-Agent", "pulse-esp32-dma/1.0");
-    http.setTimeout(5000);
+    http.setTimeout(5000); // allow headroom for TLS + server write
 
     int code = http.POST((uint8_t*)payload, payloadLen);
     bool ok = (code >= 200 && code < 300);
@@ -205,7 +190,7 @@ UploadResult postBatch(HTTPClient& http, FlatSample* buf, size_t count)
         }
     }
 
-    http.end();
+    http.end();   // always release the connection + TLS context, success or fail
 
     if (ok)
         return UploadResult::Ok;
@@ -222,6 +207,11 @@ UploadResult postBatch(HTTPClient& http, FlatSample* buf, size_t count)
     return UploadResult::Retry;
 }
 
+//------------------------------------------------------------
+// Upload task: one DMA block in, one POST out. Each block already IS a
+// full batch (BATCH_SIZE == DMA_BUF_LEN), so unlike the old BLE notify
+// path there's no need to coalesce multiple queue items before sending.
+//------------------------------------------------------------
 void uploadTask(void* param)
 {
     static FlatSample buffer[BATCH_SIZE];
@@ -236,6 +226,9 @@ void uploadTask(void* param)
 
         if (xQueueReceive(sampleQueue, &block, portMAX_DELAY) == pdTRUE && block.count > 0)
         {
+            // Spread each sample's timestamp linearly across the time the
+            // block actually took to acquire, instead of stamping every
+            // sample in the block with the same millisecond.
             double usPerSample = (double)block.durationUs / block.count;
 
             for (uint16_t i = 0; i < block.count; i++)
@@ -272,6 +265,7 @@ void uploadTask(void* param)
             }
         }
 
+        // ---- Upload rate report (every 5 sec) ----
         uint32_t now = millis();
         if (now - lastUploadReport >= 5000)
         {
@@ -286,6 +280,9 @@ void uploadTask(void* param)
     }
 }
 
+//------------------------------------------------------------
+// WiFi + NTP
+//------------------------------------------------------------
 void setupTime()
 {
     Serial.print("Connecting to WiFi");
@@ -317,7 +314,7 @@ void setupTime()
         if (millis() - start > 15000) {
             Serial.println("\nNTP timeout, retrying with backup server...");
             configTime(19800, 0, "time.google.com", "time.cloudflare.com");
-            start = millis();
+            start = millis(); // give the new servers a fresh window
         }
     }
     Serial.println("\nTime synchronized");
@@ -348,6 +345,8 @@ void setupAdcDma()
     i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
     i2s_set_adc_mode(ADC_UNIT_1, ADC_CHANNEL);
     i2s_adc_enable(I2S_PORT);
+
+    Serial.println("ADC DMA started");
 }
 
 //------------------------------------------------------------
@@ -355,8 +354,8 @@ void setupAdcDma()
 //------------------------------------------------------------
 void setup()
 {
-    Serial.setTxBufferSize(8192); // Large TX buffer for high-speed binary writes
-    Serial.begin(SERIAL_BAUD_RATE);
+    Serial.begin(921600); // 115200
+    // Serial.begin(1000000);
     delay(1000);
 
     #if !TELEMETRY_VIEWER
@@ -367,21 +366,32 @@ void setup()
     Serial.print("HTTP URL         : ");
     Serial.println(SERVER_URL);
     Serial.println("--------------------------------");
+    #endif
 
     setupTime();
 
+    // TLS requires setInsecure() or a pinned CA. Using setInsecure() for throughput.
     netClient.setInsecure();
     netClient.setHandshakeTimeout(15);
 
+    #if !TELEMETRY_VIEWER
     sampleQueue = xQueueCreate(SAMPLE_QUEUE_DEPTH, sizeof(DmaBlock));
+
+    // Stack 16384: TLS handshake needs ~10 KB of stack on ESP32
     xTaskCreatePinnedToCore(uploadTask, "uploadTask", 16384, nullptr, 1, nullptr, 1);
     #endif
 
     setupAdcDma();
+
+    Serial.printf("[Boot] Free heap after init: %u | Largest block: %u bytes\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
 //------------------------------------------------------------
-// Loop - High-Speed Binary Streaming via Serial.write
+// Loop - DMA producer. Runs on the default Arduino loop task (core 1);
+// uploadTask (core 1 also, separate task) drains the queue independently
+// so a slow POST never blocks the next DMA read.
 //------------------------------------------------------------
 void loop()
 {
@@ -392,8 +402,8 @@ void loop()
         I2S_PORT,
         dmaSamples,
         sizeof(dmaSamples),
-        &bytesRead,
-        portMAX_DELAY);
+             &bytesRead,
+             portMAX_DELAY);
 
     uint32_t elapsed = micros() - startMicros;
     uint32_t sampleCount = bytesRead / sizeof(uint16_t);
@@ -410,22 +420,18 @@ void loop()
         block.values[i] = dmaSamples[i] & 0x0FFF;
 
     #if TELEMETRY_VIEWER
-    // High-speed binary transmission: Write framed packet (Header + Raw 16-bit uint16 values)
-    BinaryPacketHeader header;
-    header.magic[0] = 0xAA;
-    header.magic[1] = 0x55;
-    header.count = (uint16_t)sampleCount;
-    header.epochSec = (uint32_t)tv.tv_sec;
-    header.ms = (uint16_t)(tv.tv_usec / 1000);
-    header.durationUs = elapsed;
+    for (uint32_t i = 0; i < sampleCount; i += 1)
+    {
+        Serial.println(block.values[i]);
+    }
+    #endif
 
-    Serial.write((const uint8_t*)&header, sizeof(header));
-    Serial.write((const uint8_t*)block.values, sampleCount * sizeof(uint16_t));
-    #else
+    #if !TELEMETRY_VIEWER
     if (xQueueSend(sampleQueue, &block, 0) != pdTRUE)
     {
         droppedBlocks++;
     }
+    #endif
 
     totalSamples += sampleCount;
 
@@ -434,6 +440,7 @@ void loop()
     {
         float rate = totalSamples * 1000.0f / (now - lastReport);
 
+        #if !TELEMETRY_VIEWER
         Serial.println("--------------------------------");
         Serial.printf("DMA Rate     : %.1f samples/sec (target %d)\n", rate, SAMPLE_RATE);
         Serial.printf("Queue Used   : %u / %u\n",
@@ -442,9 +449,9 @@ void loop()
         Serial.printf("Dropped      : %u blocks\n", (unsigned)droppedBlocks);
         Serial.printf("Free Heap    : %u bytes\n", (unsigned)ESP.getFreeHeap());
         Serial.println("--------------------------------");
+        #endif
 
         totalSamples = 0;
         lastReport = now;
     }
-    #endif
 }
