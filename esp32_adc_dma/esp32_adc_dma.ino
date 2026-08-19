@@ -18,7 +18,28 @@
 #define DMA_BUF_LEN    1024
 #define DMA_BUF_COUNT  4
 #define ADC_CHANNEL    ADC1_CHANNEL_6   // GPIO34
-#define TELEMETRY_VIEWER 1
+#define TELEMETRY_VIEWER 0
+
+// ----------------------------------------------------------------
+// Binary frame format for TELEMETRY_VIEWER mode (see chat for rationale).
+// One frame per DMA block, little-endian, no padding (14-byte header):
+//
+//   uint16_t magic       0x55AA sentinel (bytes: 0xAA, 0x55 in little-endian)
+//   uint16_t count        number of uint16_t sample values following
+//   uint32_t epochSec     block start time in seconds
+//   uint16_t ms            block start time, milliseconds
+//   uint32_t durationUs   wall-clock time the block took to acquire
+//   ... count * uint16_t sample values ...
+// ----------------------------------------------------------------
+#pragma pack(push, 1)
+struct ViewerFrameHeader {
+    uint16_t magic;
+    uint16_t count;
+    uint32_t epochSec;
+    uint16_t ms;
+    uint32_t durationUs;
+};
+#pragma pack(pop)
 
 uint16_t dmaSamples[DMA_BUF_LEN];
 
@@ -50,6 +71,17 @@ enum class UploadResult : uint8_t
 };
 
 const size_t BATCH_SIZE = DMA_BUF_LEN;          // one full DMA block per POST
+// NOTE: at 80kHz each block arrives every 12.8ms (1024 samples / 80000).
+// uploadTask has to finish JSON-encoding *and* the full HTTPS POST round
+// trip inside that window on average, or the queue backs up and blocks
+// start dropping (see droppedBlocks below). That's a very tight budget
+// for TLS+HTTP even with connection reuse. If you're seeing the same
+// rate shortfall in this path (TELEMETRY_VIEWER=0), the fix is the same
+// idea as the viewer path - cut bytes/sample (binary payload instead of
+// JSON), and/or amortize per-request overhead by batching multiple
+// blocks per POST, and/or decimate on-device if you don't need every
+// raw sample, and/or move to a persistent connection (WebSocket/raw
+// TCP) instead of discrete HTTPS POSTs.
 const size_t JSON_PAYLOAD_CAPACITY = 40960;     // ~1024 samples * ~35B + headroom
 
 // Queue depth is RAM-bound, not rate-bound: each DmaBlock is ~2KB, so this
@@ -354,8 +386,21 @@ void setupAdcDma()
 //------------------------------------------------------------
 void setup()
 {
-    Serial.begin(921600); // 115200
-    // Serial.begin(1000000);
+    // ASCII line-based printing (old loop() code) tops out around
+    // 15-20k lines/sec even at high baud - nowhere near 80kHz. Binary
+    // framing (see loop()) needs roughly 1.6Mbaud minimum just to fit
+    // raw 16-bit samples at 80,000/sec (80000 * 2 bytes * 10 bits/byte),
+    // so the baud rate has to go up too, not just the encoding.
+    // setTxBufferSize must be called before begin(); a bigger ring
+    // buffer absorbs scheduling jitter between DMA blocks arriving and
+    // the UART draining them.
+    //
+    // Test for framing errors before trusting a given rate - CP2102N /
+    // FTDI bridges are generally fine well past 2,000,000; CH340-based
+    // boards tend to be more hit-or-miss above ~1,500,000. Push higher
+    // (3,000,000+) if your hardware supports it for more headroom.
+    Serial.setTxBufferSize(4096);
+    Serial.begin(2000000); // was 921600 / previously tried 1000000 / 115200
     delay(1000);
 
     #if !TELEMETRY_VIEWER
@@ -368,17 +413,30 @@ void setup()
     Serial.println("--------------------------------");
     #endif
 
+    #if !TELEMETRY_VIEWER
+    // WiFi + NTP are only needed for the HTTPS upload path. setupTime()
+    // blocks (and can restart the board) waiting on a WiFi connection,
+    // so it was previously delaying/blocking ADC startup even in viewer
+    // mode, where there's no network dependency at all - if WiFi wasn't
+    // reachable, the board would sit here retrying and never reach
+    // setupAdcDma()/loop(), and the binary stream would never start.
     setupTime();
 
     // TLS requires setInsecure() or a pinned CA. Using setInsecure() for throughput.
     netClient.setInsecure();
     netClient.setHandshakeTimeout(15);
 
-    #if !TELEMETRY_VIEWER
     sampleQueue = xQueueCreate(SAMPLE_QUEUE_DEPTH, sizeof(DmaBlock));
 
     // Stack 16384: TLS handshake needs ~10 KB of stack on ESP32
     xTaskCreatePinnedToCore(uploadTask, "uploadTask", 16384, nullptr, 1, nullptr, 1);
+    #else
+    // Viewer mode: no WiFi/NTP, so gettimeofday()-based epochSec/ms in
+    // loop() will just be relative-to-boot (starts near 0), not real
+    // wall-clock time. That's fine for a local capture where you mostly
+    // care about durationUs/sample values - flip TELEMETRY_VIEWER off
+    // if you need accurate epoch timestamps.
+    Serial.println("TELEMETRY_VIEWER mode: skipping WiFi/NTP, starting ADC DMA immediately.");
     #endif
 
     setupAdcDma();
@@ -420,10 +478,23 @@ void loop()
         block.values[i] = dmaSamples[i] & 0x0FFF;
 
     #if TELEMETRY_VIEWER
-    for (uint32_t i = 0; i < sampleCount; i += 1)
-    {
-        Serial.println(block.values[i]);
-    }
+    // Binary frame instead of per-sample ASCII println(). At 80kHz,
+    // 1024-sample blocks arrive every 12.8ms; println() per sample costs
+    // several bytes plus a full format+write call each time and can't
+    // keep up at any reasonable baud. The DMA keeps sampling at the true
+    // configured rate regardless of how fast this loop drains it, so a
+    // slow consumer here just means most samples get silently
+    // overwritten before we ever read them - that's the actual source
+    // of the rate falling short, not the ADC/DMA itself.
+    ViewerFrameHeader hdr;
+    hdr.magic      = 0x55AA; // 0xAA, 0x55 in little-endian
+    hdr.count      = (uint16_t)sampleCount;
+    hdr.epochSec   = (uint32_t)block.epochSec;
+    hdr.ms         = block.ms;
+    hdr.durationUs = block.durationUs;
+
+    Serial.write((const uint8_t*)&hdr, sizeof(hdr));
+    Serial.write((const uint8_t*)block.values, sampleCount * sizeof(uint16_t));
     #endif
 
     #if !TELEMETRY_VIEWER
