@@ -52,8 +52,6 @@ Acquiring continuous high-frequency analogue signals (80 kHz) without sample dro
 ## 🔋 Empirical Power Measurements (Nordic PPK2)
 
 Measured empirically using a **Nordic Power Profiler Kit II (PPK2)** under real 80,000 Hz UDP streaming and deep sleep duty cycles:
-<img width="1556" height="649" alt="image" src="https://[github.com/psudocoderr/piezo-dma/blob/main/assets/ppk2_power_profile.png]" />
-
 
 ```
        Peak Wi-Fi TX Spike: 256 mA
