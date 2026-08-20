@@ -1,17 +1,19 @@
-# 80kHz Piezo Sensor DMA & UDP Transport Engine (v1.0)
+# 80kHz Piezo Sensor DMA & UDP Transport Engine (v2.0)
 
-High-performance, ultra-low-latency 80,000 Hz continuous acquisition system for piezoelectric sensors using ESP32 Hardware DMA and UDP Wi-Fi burst streaming.
+High-performance, ultra-low-latency 80,000 Hz continuous acquisition system for piezoelectric sensors using ESP32 Hardware DMA, UDP Wi-Fi burst streaming, and Power-Optimized Deep Sleep Engine.
 
 ---
 
 ## 📖 Table of Contents
 1. [Theory of Operation](#-theory-of-operation)
 2. [Repository & Directory Structure](#-repository--directory-structure)
-3. [Binary Protocol Specification](#-binary-protocol-specification)
-4. [Commands & Execution Guide](#-commands--execution-guide)
-5. [Telemetry & Web Visualizer](#-telemetry--web-visualizer)
-6. [Testing & Diagnostic Suite](#-testing--diagnostic-suite)
-7. [Comprehensive Troubleshooting Guide](#-comprehensive-troubleshooting-guide)
+3. [Empirical Power Measurements (Nordic PPK2)](#-empirical-power-measurements-nordic-ppk2)
+4. [Binary Protocol Specification](#-binary-protocol-specification)
+5. [Firmware Variants (v1.0 Baseline vs v2.0 Deep Sleep)](#-firmware-variants)
+6. [Commands & Execution Guide](#-commands--execution-guide)
+7. [Telemetry & Web Visualizer](#-telemetry--web-visualizer)
+8. [Testing & Diagnostic Suite](#-testing--diagnostic-suite)
+9. [Comprehensive Troubleshooting Guide](#-comprehensive-troubleshooting-guide)
 
 ---
 
@@ -40,10 +42,36 @@ Acquiring continuous high-frequency analogue signals (80 kHz) without sample dro
 3. **Non-Blocking UDP Burst Streaming**:
    Samples are aggregated into 400-reading bursts (1,200 payload bytes). A total datagram of **1,210 bytes** (Header + Payload + CRC16) is transmitted via Wi-Fi UDP at 200 packets per second (80,000 samples/sec). UDP overhead is minimized while staying safely under the standard 1,500-byte Ethernet MTU.
 
-4. **Data Sanity & Verification Engine**:
-   - **Sequence Number Tracking**: Detects dropped Wi-Fi packets and calculates real-time packet loss percentage.
-   - **CRC16-CCITT Checksum**: 16-bit CRC computed across the header and payload to drop corrupted Wi-Fi datagrams.
-   - **Rail Saturation & Flatline Monitoring**: Automatic flags when ADC values hit 4095 (high-rail saturation) or <= 5 (sensor disconnection).
+4. **v2.0 Power Optimization & Deep Sleep Engine**:
+   - **Duty-Cycled Operation**: Samples continuously at 80 kHz for a configured active window (e.g., 60 seconds / 4.8 Million samples).
+   - **Full Peripheral Shutdown**: Automatically uninstalls I2S DMA drivers, turns off the Wi-Fi radio (`WIFI_OFF`), and powers down CPU & RTC domain peripherals.
+   - **Low-Power RTC Timer Wakeup**: Enters deep sleep mode for a configurable duration (e.g., 180 seconds). Boot count is preserved in RTC slow memory (`RTC_DATA_ATTR`).
+
+---
+
+## 🔋 Empirical Power Measurements (Nordic PPK2)
+
+Measured empirically using a **Nordic Power Profiler Kit II (PPK2)** under real 80,000 Hz UDP streaming and deep sleep duty cycles:
+
+```
+       Peak Wi-Fi TX Spike: 256 mA
+                 ▲
+   200mA ────────┼────────────┐
+                 │  Active    │ (136 mA Avg)
+   100mA ────────┴────────────┘
+     0mA ─────────────────────██████████████████ (4.32 mA Deep Sleep Baseline)
+         └────────┬──────────┘└───────┬────────┘
+             1 Min Active        3 Min Deep Sleep
+             
+           Overall Cycle Average: 38.21 mA
+```
+
+* **Deep Sleep Baseline**: **~4.32 mA** (ESP32 core in deep sleep ~10µA + DevKit V1 onboard CP2102/CH340 USB-UART bridge & AMS1117 LDO quiescent draw).
+* **Active Operational Average**: **~136.00 mA** (Wi-Fi TX @ 200 pkts/sec + 80kHz DMA engine).
+* **Maximum Peak Current**: **256.00 mA** (Wi-Fi RF transmit spikes).
+* **Total Cycle Average**: **~38.21 mA** (Weighted average over 1-min active / 3-min sleep).
+
+For full details, hardware setup diagrams, and test screenshots, see the dedicated [firmware_esp32_dma_udp_deepsleep README](file:///home/lyniks0611/Cloud/OneDrive02/Documents/Arduino/piezo-dma/firmware/firmware_esp32_dma_udp_deepsleep/README.md).
 
 ---
 
@@ -52,12 +80,18 @@ Acquiring continuous high-frequency analogue signals (80 kHz) without sample dro
 ```
 piezo-dma/
 ├── .gitignore                      # Git ignore rules (filters python bytecode, binaries, secrets)
-├── README.md                       # Comprehensive operational & protocol manual
+├── README.md                       # Main operational & protocol manual
 ├── firmware/
-│   └── firmware_esp32_dma_udp/
-│       ├── firmware_esp32_dma_udp.ino   # Core 80kHz DMA UDP C++ firmware (ESP32 DevKit V1)
-│       ├── secrets.h.example            # Wi-Fi SSID & UDP IP template
-│       └── secrets.h                    # Private credentials (git-ignored)
+│   ├── firmware_esp32_dma_udp/               # (v1.0) Standard DMA UDP Firmware (Always On)
+│   │   ├── firmware_esp32_dma_udp.ino
+│   │   ├── secrets.h.example
+│   │   └── secrets.h
+│   └── firmware_esp32_dma_udp_deepsleep/     # (v2.0) Power-Optimized Deep Sleep Firmware
+│       ├── firmware_esp32_dma_udp_deepsleep.ino
+│       ├── secrets.h.example
+│       ├── README.md                          # Dedicated Deep Sleep manual & PPK2 profile
+│       ├── secrets.h
+│       └── assets/                            # Test screenshots (PPK2, CSV log, Telemetry scope)
 ├── server/
 │   └── receiver.py                 # Main 80kHz UDP Receiver, Validator & CSV Logger
 ├── telemetry/
@@ -72,6 +106,17 @@ piezo-dma/
     ├── esp32_network_troubleshooter.py # Wi-Fi latency & socket ping tool
     └── serial_piezo_receiver.py    # Fallback high-speed Serial binary receiver (3 Mbaud)
 ```
+
+---
+
+## ⚡ Firmware Variants
+
+| Feature | `v1.0` Standard (`firmware_esp32_dma_udp`) | `v2.0` Deep Sleep (`firmware_esp32_dma_udp_deepsleep`) |
+| :--- | :--- | :--- |
+| **Operating Mode** | Continuous 24/7 Streaming | Duty-Cycled Burst (1 min active / 3 min sleep) |
+| **Average Current** | ~136 mA – 160 mA (Active Wi-Fi) | **~38.21 mA** (Cycle Average) / **4.32 mA** (Sleep Baseline) |
+| **Wakeup Mechanism** | Power-on / Hardware Reset | Low-Power RTC Timer Wakeup |
+| **RTC Data Retention** | No | Yes (`RTC_DATA_ATTR bootCount`) |
 
 ---
 
@@ -105,38 +150,26 @@ Repeated `400` times:
 ## 🚀 Commands & Execution Guide
 
 ### 1. Firmware Setup (ESP32 DevKit V1)
-1. Copy `firmware/firmware_esp32_dma_udp/secrets.h.example` to `secrets.h`:
-   ```bash
-   cp firmware/firmware_esp32_dma_udp/secrets.h.example firmware/firmware_esp32_dma_udp/secrets.h
-   ```
-2. Edit `secrets.h` with your Wi-Fi SSID, password, and host IP address:
-   ```cpp
-   #define WIFI_SSID     "Your_WiFi_SSID"
-   #define WIFI_PASSWORD "Your_WiFi_Password"
-   #define UDP_DEST_IP   "192.168.1.100"  // Host PC IP address
-   #define UDP_DEST_PORT 5005
-   ```
-3. Open `firmware/firmware_esp32_dma_udp/firmware_esp32_dma_udp.ino` in Arduino IDE or VS Code PlatformIO.
-4. Select Board: **ESP32 Dev Module** (ESP32-D0WD / DevKit V1).
-5. Flash firmware and open Serial Monitor at **3,000,000 baud** (or 115,200 for boot text).
+Select your desired variant:
+* **Standard 24/7 Streaming**: Use `firmware/firmware_esp32_dma_udp/`
+* **Deep Sleep Duty Cycle**: Use `firmware/firmware_esp32_dma_udp_deepsleep/`
+
+```bash
+# Copy credentials template
+cp firmware/firmware_esp32_dma_udp_deepsleep/secrets.h.example firmware/firmware_esp32_dma_udp_deepsleep/secrets.h
+```
+Edit `secrets.h` with your Wi-Fi SSID, password, and target IP address.
 
 ### 2. Main Receiver & CSV Logging Server
 Run the primary receiver server on the Host PC:
 ```bash
 python3 server/receiver.py --ip 0.0.0.0 --port 5005 --csv piezo_data.csv --verbose
 ```
-* **Output Format**:
-  ```csv
-  ts,adc_raw
-  20-08-2026 13:45:00:123.123456,2048
-  20-08-2026 13:45:00:123.135956,2054
-  ```
 
 ---
 
 ## 📊 Telemetry & Web Visualizer
 
-### 1. Running Web Telemetry Server
 Start the real-time telemetry server:
 ```bash
 # Terminal 1: Launch WebSocket Relay
@@ -147,14 +180,9 @@ python3 telemetry/telemetry_web_server.py --port 8080
 ```
 Navigate to `http://localhost:8080` in your web browser.
 
-### 2. 3rd-Party Telemetry Viewer Setup
-Refer to [telemetry_viewer_config.md](file:///home/lyniks0611/Cloud/OneDrive02/Documents/Arduino/piezo-dma/telemetry/telemetry_viewer_config.md) for step-by-step instructions on setting up Telemetry Viewer GUI over UDP.
-
 ---
 
 ## 🧪 Testing & Diagnostic Suite
-
-Run test scripts from the root directory:
 
 ```bash
 # 1. Run Packet Parser Unit Tests
@@ -163,14 +191,11 @@ python3 tests/test_pkt_parse.py
 # 2. Run CRC16 Diagnostic Verification
 python3 tests/test_crc_diag.py
 
-# 3. Simulate 80kHz ESP32 UDP Sender (No hardware required)
+# 3. Simulate 80kHz ESP32 UDP Sender
 python3 tests/mock_udp_sender.py --ip 127.0.0.1 --port 5005 --rate 200
 
 # 4. Monitor UDP Traffic & Packet Rates
 python3 tests/udp_diagnostic_listener.py --port 5005
-
-# 5. ESP32 Network Troubleshooter & Ping Tool
-python3 tests/esp32_network_troubleshooter.py --ip 192.168.1.150
 ```
 
 ---
