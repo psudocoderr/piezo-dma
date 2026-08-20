@@ -52,6 +52,8 @@ Acquiring continuous high-frequency analogue signals (80 kHz) without sample dro
 ## 🔋 Empirical Power Measurements (Nordic PPK2)
 
 Measured empirically using a **Nordic Power Profiler Kit II (PPK2)** under real 80,000 Hz UDP streaming and deep sleep duty cycles:
+<img width="1556" height="649" alt="image" src="https://[github.com/psudocoderr/piezo-dma/blob/main/assets/ppk2_power_profile.png]" />
+
 
 ```
        Peak Wi-Fi TX Spike: 256 mA
@@ -81,6 +83,10 @@ For full details, hardware setup diagrams, and test screenshots, see the dedicat
 piezo-dma/
 ├── .gitignore                      # Git ignore rules (filters python bytecode, binaries, secrets)
 ├── README.md                       # Main operational & protocol manual
+├── assets/                                   # Root Assets Directory
+│   ├── ppk2_power_profile.png                # Nordic PPK2 measurement plot
+│   ├── csv_data_logger_3v3.png               # 3.3V rail saturation CSV logger
+│   └── telemetry_viewer_scope.png            # Telemetry Viewer v0.9 scope
 ├── firmware/
 │   ├── firmware_esp32_dma_udp/               # (v1.0) Standard DMA UDP Firmware (Always On)
 │   │   ├── firmware_esp32_dma_udp.ino
